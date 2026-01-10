@@ -1,6 +1,8 @@
-fastapi
-uvicorn
-numpy
-opencv-python-headless
+fastapi==0.128.0
+uvicorn==0.40.0
+numpy<2.0
+opencv-python-headless==4.9.0.80
+insightface==0.7.3
+onnxruntime==1.17.3
 scikit-learn
 python-multipart
