@@ -8,17 +8,16 @@ from insightface.app import FaceAnalysis
 from sklearn.metrics.pairwise import cosine_similarity
 
 # =======================
-# PATHS
+# BASE PATH
 # =======================
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_PATH, "model")
 
-EMB_PATH = os.path.join(MODEL_PATH, "embeddings.npy")
-LBL_PATH = os.path.join(MODEL_PATH, "labels.npy")
-THR_PATH = os.path.join(MODEL_PATH, "threshold.txt")
+EMB_PATH = os.path.join(BASE_PATH, "embeddings.npy")
+LBL_PATH = os.path.join(BASE_PATH, "labels.npy")
+THR_PATH = os.path.join(BASE_PATH, "threshold.txt")
 
 # =======================
-# LOAD MODEL DATA
+# LOAD DATA
 # =======================
 embeddings = np.load(EMB_PATH)
 labels = np.load(LBL_PATH)
@@ -43,10 +42,13 @@ face_app.prepare(
 # =======================
 # FASTAPI
 # =======================
-app = FastAPI(title="Face Recognition API", version="1.0")
+app = FastAPI(
+    title="Professional Face Recognition API",
+    version="1.0.0"
+)
 
 # =======================
-# HEALTH
+# HEALTH CHECK
 # =======================
 @app.get("/health")
 def health():
@@ -54,7 +56,8 @@ def health():
         "status": "ok",
         "gpu": torch.cuda.is_available(),
         "threshold": AUTO_THRESHOLD,
-        "identities": int(labels.max()) + 1
+        "total_embeddings": int(len(embeddings)),
+        "unique_ids": int(len(set(labels.tolist())))
     }
 
 # =======================
@@ -63,16 +66,23 @@ def health():
 @app.post("/identify")
 async def identify(image: UploadFile = File(...)):
     try:
-        img_bytes = await image.read()
-        img_np = np.frombuffer(img_bytes, np.uint8)
+        image_bytes = await image.read()
+        img_np = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid image file"}
+            )
+
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         faces = face_app.get(img)
         if len(faces) != 1:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Exactly one face required"}
+                content={"error": "Exactly one face must be visible"}
             )
 
         emb = faces[0].embedding.reshape(1, -1)
@@ -96,4 +106,7 @@ async def identify(image: UploadFile = File(...)):
         }
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
