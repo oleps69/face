@@ -1,14 +1,33 @@
 import os
+import sys
+import subprocess
 import cv2
 import numpy as np
-import torch
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from insightface.app import FaceAnalysis
 from sklearn.metrics.pairwise import cosine_similarity
 
 # =======================
-# BASE PATH
+# RUNTIME INSTALL (CRITICAL)
+# =======================
+def install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+try:
+    import torch
+except ImportError:
+    install("torch")
+    import torch
+
+try:
+    from insightface.app import FaceAnalysis
+except ImportError:
+    install("onnxruntime")
+    install("insightface")
+    from insightface.app import FaceAnalysis
+
+# =======================
+# PATHS (SENİN YAPIN)
 # =======================
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,16 +45,17 @@ with open(THR_PATH, "r") as f:
     AUTO_THRESHOLD = float(f.read())
 
 # =======================
-# FACE MODEL
+# FACE MODEL (CPU ONLY)
 # =======================
-providers = ["CUDAExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+providers = ["CPUExecutionProvider"]
 
 face_app = FaceAnalysis(
-    name="buffalo_l",
+    name="buffalo_s",  # buffalo_l yerine SÜRAT + STABIL
     providers=providers
 )
+
 face_app.prepare(
-    ctx_id=0 if torch.cuda.is_available() else -1,
+    ctx_id=-1,          # CPU
     det_size=(640, 640)
 )
 
@@ -54,7 +74,7 @@ app = FastAPI(
 def health():
     return {
         "status": "ok",
-        "gpu": torch.cuda.is_available(),
+        "gpu": False,
         "threshold": AUTO_THRESHOLD,
         "total_embeddings": int(len(embeddings)),
         "unique_ids": int(len(set(labels.tolist())))
@@ -79,10 +99,11 @@ async def identify(image: UploadFile = File(...)):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         faces = face_app.get(img)
+
         if len(faces) != 1:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Exactly one face must be visible"}
+                content={"error": "Exactly one face must be present"}
             )
 
         emb = faces[0].embedding.reshape(1, -1)
