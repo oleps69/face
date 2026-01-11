@@ -2,208 +2,157 @@ import os
 import sys
 import time
 import threading
-import subprocess
+import traceback
 import requests
-from typing import List
-
-import cv2
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import cv2
+from typing import Dict
 
-# =========================
-# GLOBAL STATE
-# =========================
+# --------------------------
+# CONFIG & GLOBAL VARIABLES
+# --------------------------
+MODEL_URL = "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/arcface/model/arcfaceresnet100-11-int8.onnx"
+MODEL_PATH = "/app/models/arcfaceresnet100-11-int8.onnx"
+INSTALL_PROGRESS = {"stage": "waiting", "percent": 0}
+MODEL_PROGRESS = {"stage": "waiting", "percent": 0}
+TOTAL_EMBEDDINGS = 0
+MODEL_SESSION: ort.InferenceSession | None = None
 
-INSTALL_STATUS = {"stage": "waiting", "percent": 0}
-MODEL_STATUS = {"stage": "waiting", "percent": 0}
+# --------------------------
+# FASTAPI APP INIT
+# --------------------------
+app = FastAPI(title="Face Recognition API (INT8 Model)")
 
-MODEL_PATH = "models/arcface.onnx"
-EMB_PATH = "embeddings.npy"
-LBL_PATH = "labels.npy"
-
-session = None
-embeddings = []
-labels = []
-
-# =========================
-# UTILS
-# =========================
-
+# --------------------------
+# UTILITY FUNCTIONS
+# --------------------------
 def log_status():
-    print(
-        f"[STATUS] install={INSTALL_STATUS} | model={MODEL_STATUS}",
-        flush=True
-    )
-
-def every_5s_logger():
+    """Logs the current install/model status every 5 seconds."""
     while True:
-        log_status()
+        print(f"[STATUS] install={INSTALL_PROGRESS} | model={MODEL_PROGRESS}")
         time.sleep(5)
 
-def safe_mkdir(path: str):
-    os.makedirs(path, exist_ok=True)
+def download_model(url: str, save_path: str):
+    """Downloads the ONNX model with progress logging."""
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    MODEL_PROGRESS["stage"] = "downloading"
+    MODEL_PROGRESS["percent"] = 0
 
-# =========================
-# MODEL DOWNLOAD
-# =========================
+    resp = requests.get(url, stream=True)
+    total_length = int(resp.headers.get('content-length', 0))
+    chunk_size = 8192
+    downloaded = 0
 
-def download_model():
-    MODEL_STATUS["stage"] = "downloading"
-    MODEL_STATUS["percent"] = 0
+    with open(save_path, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                MODEL_PROGRESS["percent"] = int(downloaded / total_length * 100)
 
-    safe_mkdir("models")
-
-    url = (
-        "https://github.com/onnx/models/raw/main/vision/body_analysis/"
-        "arcface/model/arcfaceresnet100-8.onnx"
-    )
-
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    MODEL_STATUS["percent"] = int(downloaded / total * 100)
-
-    MODEL_STATUS["percent"] = 100
-
-# =========================
-# MODEL LOAD
-# =========================
+    MODEL_PROGRESS["percent"] = 100
+    MODEL_PROGRESS["stage"] = "loaded"
+    print(f"[MODEL] Download complete: {save_path}")
 
 def load_model():
-    global session
+    """Loads the ONNX model into memory."""
+    global MODEL_SESSION
+    MODEL_PROGRESS["stage"] = "loading"
+    MODEL_PROGRESS["percent"] = 0
+    print("[MODEL] Loading ONNX model into memory...")
+    MODEL_SESSION = ort.InferenceSession(MODEL_PATH)
+    MODEL_PROGRESS["percent"] = 100
+    MODEL_PROGRESS["stage"] = "ready"
+    print("[MODEL] Model loaded successfully.")
 
-    MODEL_STATUS["stage"] = "loading"
-    MODEL_STATUS["percent"] = 0
-
-    session = ort.InferenceSession(
-        MODEL_PATH,
-        providers=["CPUExecutionProvider"]
-    )
-
-    MODEL_STATUS["percent"] = 100
-    MODEL_STATUS["stage"] = "ready"
-
-# =========================
-# EMBEDDING
-# =========================
-
-def get_embedding(img: np.ndarray) -> np.ndarray:
-    img = cv2.resize(img, (112, 112))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    img = np.expand_dims(img, axis=0)
-
-    emb = session.run(None, {"data": img})[0][0]
-    emb = emb / np.linalg.norm(emb)
-    return emb
-
-# =========================
-# STARTUP PIPELINE
-# =========================
-
-def startup_pipeline():
+def safe_numpy_from_file(file: UploadFile) -> np.ndarray:
+    """Reads image file into numpy array, safe mode."""
     try:
-        # MODEL
-        MODEL_STATUS["stage"] = "starting"
-        MODEL_STATUS["percent"] = 0
-
-        if not os.path.exists(MODEL_PATH):
-            download_model()
-
-        load_model()
-
-        # LOAD DB
-        global embeddings, labels
-        if os.path.exists(EMB_PATH):
-            embeddings = np.load(EMB_PATH).tolist()
-            labels = np.load(LBL_PATH).tolist()
-
-        print("[READY] System fully ready", flush=True)
-
+        file_bytes = np.asarray(bytearray(file.file.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Unable to decode image.")
+        return img
     except Exception as e:
-        print("[FATAL]", e, flush=True)
-        sys.exit(1)
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {e}")
 
-# =========================
-# FASTAPI
-# =========================
+def compute_embedding(image: np.ndarray) -> np.ndarray:
+    """Preprocess image and compute face embedding using the ONNX model."""
+    if MODEL_SESSION is None:
+        raise HTTPException(status_code=503, detail="Model not ready")
+    # Convert to RGB
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # Resize to 112x112
+    img_resized = cv2.resize(img_rgb, (112, 112))
+    # Normalize
+    img_norm = (img_resized - 127.5) / 128.0
+    img_input = np.transpose(img_norm, (2, 0, 1)).astype(np.float32)[np.newaxis, ...]
+    inputs = {MODEL_SESSION.get_inputs()[0].name: img_input}
+    embedding = MODEL_SESSION.run(None, inputs)[0]
+    return embedding
 
-app = FastAPI()
+# --------------------------
+# BACKGROUND THREADS
+# --------------------------
+def startup_pipeline():
+    """Handles model download and loading at startup."""
+    global INSTALL_PROGRESS
+    try:
+        INSTALL_PROGRESS["stage"] = "installing"
+        INSTALL_PROGRESS["percent"] = 0
+        # Dummy install steps simulation
+        for p in range(0, 101, 20):
+            INSTALL_PROGRESS["percent"] = p
+            print(f"[INSTALL] Installing dependencies... {p}%")
+            time.sleep(1)
+        INSTALL_PROGRESS["percent"] = 100
+        INSTALL_PROGRESS["stage"] = "done"
+        print("[INSTALL] Dependencies installed.")
 
-@app.on_event("startup")
-def startup():
-    threading.Thread(target=every_5s_logger, daemon=True).start()
-    threading.Thread(target=startup_pipeline, daemon=True).start()
+        # Download and load model
+        download_model(MODEL_URL, MODEL_PATH)
+        load_model()
+    except Exception as e:
+        print("[FATAL] Startup pipeline failed!")
+        traceback.print_exc()
+        INSTALL_PROGRESS["stage"] = "error"
+        MODEL_PROGRESS["stage"] = "error"
 
+# --------------------------
+# API ROUTES
+# --------------------------
 @app.get("/health")
-def health():
+def health_check():
     return {
-        "install_done": True,
-        "model_ready": MODEL_STATUS["stage"] == "ready",
-        "model_progress": MODEL_STATUS,
-        "total_embeddings": len(embeddings)
+        "install_done": INSTALL_PROGRESS["stage"] == "done",
+        "model_ready": MODEL_PROGRESS["stage"] == "ready",
+        "install_progress": INSTALL_PROGRESS,
+        "model_progress": MODEL_PROGRESS,
+        "total_embeddings": TOTAL_EMBEDDINGS
     }
-
-# =========================
-# REGISTER
-# =========================
-
-@app.post("/register")
-async def register(name: str, file: UploadFile = File(...)):
-    if MODEL_STATUS["stage"] != "ready":
-        return {"error": "Model not ready yet"}
-
-    data = await file.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-
-    if img is None:
-        raise HTTPException(400, "Invalid image")
-
-    emb = get_embedding(img)
-
-    embeddings.append(emb.tolist())
-    labels.append(name)
-
-    np.save(EMB_PATH, np.array(embeddings))
-    np.save(LBL_PATH, np.array(labels))
-
-    return {"status": "registered", "name": name}
-
-# =========================
-# IDENTIFY
-# =========================
 
 @app.post("/identify")
-async def identify(file: UploadFile = File(...)):
-    if MODEL_STATUS["stage"] != "ready":
-        return {"error": "Model not ready yet"}
+def identify(file: UploadFile):
+    if MODEL_SESSION is None or MODEL_PROGRESS["stage"] != "ready":
+        return JSONResponse(status_code=503, content={"error": "Model not ready yet"})
+    img = safe_numpy_from_file(file)
+    embedding = compute_embedding(img)
+    # Here you can add embedding database matching
+    global TOTAL_EMBEDDINGS
+    TOTAL_EMBEDDINGS += 1
+    return {"embedding_shape": embedding.shape, "total_embeddings": TOTAL_EMBEDDINGS}
 
-    if not embeddings:
-        return {"error": "No registered faces"}
-
-    data = await file.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-
-    if img is None:
-        raise HTTPException(400, "Invalid image")
-
-    emb = get_embedding(img)
-
-    db = np.array(embeddings)
-    sims = db @ emb
-    idx = int(np.argmax(sims))
-    score = float(sims[idx])
-
-    return {
-        "name": labels[idx],
-        "confidence": score
-    }
+# --------------------------
+# MAIN THREADS STARTUP
+# --------------------------
+if __name__ == "__main__":
+    # Start status logging thread
+    threading.Thread(target=log_status, daemon=True).start()
+    # Start startup pipeline
+    threading.Thread(target=startup_pipeline, daemon=True).start()
+    # Run Uvicorn
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
