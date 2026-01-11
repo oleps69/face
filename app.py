@@ -3,171 +3,207 @@ import sys
 import time
 import threading
 import subprocess
-from typing import Dict
+import requests
+from typing import List
 
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+import cv2
+import numpy as np
+import onnxruntime as ort
+from fastapi import FastAPI, UploadFile, File, HTTPException
 
-# ==============================
+# =========================
 # GLOBAL STATE
-# ==============================
-install_progress = {"stage": "waiting", "percent": 0}
-model_progress = {"stage": "waiting", "percent": 0}
+# =========================
 
-install_done = False
-model_ready = False
+INSTALL_STATUS = {"stage": "waiting", "percent": 0}
+MODEL_STATUS = {"stage": "waiting", "percent": 0}
 
-embeddings = None
-labels = None
-threshold = None
-persons = None
-face_app = None
+MODEL_PATH = "models/arcface.onnx"
+EMB_PATH = "embeddings.npy"
+LBL_PATH = "labels.npy"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+session = None
+embeddings = []
+labels = []
 
-# ==============================
-# HELPERS
-# ==============================
-def log(msg: str):
-    print(msg, flush=True)
+# =========================
+# UTILS
+# =========================
 
-def pip_install(pkg: str, percent_from: int, percent_to: int):
-    global install_progress
-    install_progress["stage"] = "installing"
-
-    log(f"[INSTALL] {pkg}")
-    subprocess.check_call(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            pkg,
-            "--only-binary=:all:",
-            "--no-cache-dir",
-        ]
+def log_status():
+    print(
+        f"[STATUS] install={INSTALL_STATUS} | model={MODEL_STATUS}",
+        flush=True
     )
-    install_progress["percent"] = percent_to
 
-# ==============================
+def every_5s_logger():
+    while True:
+        log_status()
+        time.sleep(5)
+
+def safe_mkdir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+# =========================
+# MODEL DOWNLOAD
+# =========================
+
+def download_model():
+    MODEL_STATUS["stage"] = "downloading"
+    MODEL_STATUS["percent"] = 0
+
+    safe_mkdir("models")
+
+    url = (
+        "https://github.com/onnx/models/raw/main/vision/body_analysis/"
+        "arcface/model/arcfaceresnet100-8.onnx"
+    )
+
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        downloaded = 0
+
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    MODEL_STATUS["percent"] = int(downloaded / total * 100)
+
+    MODEL_STATUS["percent"] = 100
+
+# =========================
+# MODEL LOAD
+# =========================
+
+def load_model():
+    global session
+
+    MODEL_STATUS["stage"] = "loading"
+    MODEL_STATUS["percent"] = 0
+
+    session = ort.InferenceSession(
+        MODEL_PATH,
+        providers=["CPUExecutionProvider"]
+    )
+
+    MODEL_STATUS["percent"] = 100
+    MODEL_STATUS["stage"] = "ready"
+
+# =========================
+# EMBEDDING
+# =========================
+
+def get_embedding(img: np.ndarray) -> np.ndarray:
+    img = cv2.resize(img, (112, 112))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
+
+    emb = session.run(None, {"data": img})[0][0]
+    emb = emb / np.linalg.norm(emb)
+    return emb
+
+# =========================
 # STARTUP PIPELINE
-# ==============================
+# =========================
+
 def startup_pipeline():
-    global install_done, model_ready
-    global embeddings, labels, threshold, persons, face_app
-
     try:
-        # ---------- INSTALL ----------
-        install_progress["stage"] = "starting"
-        install_progress["percent"] = 0
+        # MODEL
+        MODEL_STATUS["stage"] = "starting"
+        MODEL_STATUS["percent"] = 0
 
-        pip_install("scikit-learn", 0, 20)
-        pip_install("scipy", 20, 35)
-        pip_install("onnxruntime", 35, 50)
-        pip_install("torch", 50, 65)
-        pip_install("insightface", 65, 80)
+        if not os.path.exists(MODEL_PATH):
+            download_model()
 
-        install_progress["percent"] = 100
-        install_progress["stage"] = "done"
-        install_done = True
+        load_model()
 
-        # ---------- MODEL LOAD ----------
-        model_progress["stage"] = "loading"
-        model_progress["percent"] = 0
+        # LOAD DB
+        global embeddings, labels
+        if os.path.exists(EMB_PATH):
+            embeddings = np.load(EMB_PATH).tolist()
+            labels = np.load(LBL_PATH).tolist()
 
-        import numpy as np
-        import cv2
-        from sklearn.metrics.pairwise import cosine_similarity
-        from insightface.app import FaceAnalysis
-
-        model_progress["percent"] = 30
-
-        # Load data
-        embeddings = np.load(os.path.join(BASE_DIR, "embeddings.npy"))
-        labels = np.load(os.path.join(BASE_DIR, "labels.npy"))
-
-        with open(os.path.join(BASE_DIR, "threshold.txt")) as f:
-            threshold = float(f.read().strip())
-
-        # Optional persons.txt
-        persons_path = os.path.join(BASE_DIR, "persons.txt")
-        if os.path.exists(persons_path):
-            with open(persons_path) as f:
-                persons = [x.strip() for x in f.readlines()]
-        else:
-            persons = [f"person_{i}" for i in range(len(set(labels)))]
-
-        model_progress["percent"] = 60
-
-        face_app = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CPUExecutionProvider"]
-        )
-        face_app.prepare(ctx_id=0, det_size=(640, 640))
-
-        model_progress["percent"] = 100
-        model_progress["stage"] = "ready"
-        model_ready = True
-
-        log("[SYSTEM] Model ready")
+        print("[READY] System fully ready", flush=True)
 
     except Exception as e:
-        log(f"[FATAL] {e}")
-        install_progress["stage"] = "error"
-        model_progress["stage"] = "error"
+        print("[FATAL]", e, flush=True)
+        sys.exit(1)
 
-# ==============================
+# =========================
 # FASTAPI
-# ==============================
-app = FastAPI(title="Face Recognition API")
+# =========================
+
+app = FastAPI()
 
 @app.on_event("startup")
-def on_startup():
+def startup():
+    threading.Thread(target=every_5s_logger, daemon=True).start()
     threading.Thread(target=startup_pipeline, daemon=True).start()
 
 @app.get("/health")
 def health():
     return {
-        "install_done": install_done,
-        "model_ready": model_ready,
-        "install_progress": install_progress,
-        "model_progress": model_progress,
-        "total_embeddings": 0 if embeddings is None else len(embeddings),
+        "install_done": True,
+        "model_ready": MODEL_STATUS["stage"] == "ready",
+        "model_progress": MODEL_STATUS,
+        "total_embeddings": len(embeddings)
     }
+
+# =========================
+# REGISTER
+# =========================
+
+@app.post("/register")
+async def register(name: str, file: UploadFile = File(...)):
+    if MODEL_STATUS["stage"] != "ready":
+        return {"error": "Model not ready yet"}
+
+    data = await file.read()
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise HTTPException(400, "Invalid image")
+
+    emb = get_embedding(img)
+
+    embeddings.append(emb.tolist())
+    labels.append(name)
+
+    np.save(EMB_PATH, np.array(embeddings))
+    np.save(LBL_PATH, np.array(labels))
+
+    return {"status": "registered", "name": name}
+
+# =========================
+# IDENTIFY
+# =========================
 
 @app.post("/identify")
 async def identify(file: UploadFile = File(...)):
-    if not model_ready:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "Model not ready yet"}
-        )
+    if MODEL_STATUS["stage"] != "ready":
+        return {"error": "Model not ready yet"}
 
-    import numpy as np
-    import cv2
-    from sklearn.metrics.pairwise import cosine_similarity
+    if not embeddings:
+        return {"error": "No registered faces"}
 
-    img_bytes = await file.read()
-    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    data = await file.read()
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
-    faces = face_app.get(img)
-    if len(faces) != 1:
-        return {"error": "Exactly one face required"}
+    if img is None:
+        raise HTTPException(400, "Invalid image")
 
-    emb = faces[0].embedding.reshape(1, -1)
-    sims = cosine_similarity(emb, embeddings)[0]
+    emb = get_embedding(img)
 
-    best_idx = int(np.argmax(sims))
-    best_score = float(sims[best_idx])
-
-    if best_score < threshold:
-        return {
-            "match": False,
-            "score": round(best_score, 4),
-        }
+    db = np.array(embeddings)
+    sims = db @ emb
+    idx = int(np.argmax(sims))
+    score = float(sims[idx])
 
     return {
-        "match": True,
-        "person": persons[labels[best_idx]],
-        "score": round(best_score, 4),
+        "name": labels[idx],
+        "confidence": score
     }
