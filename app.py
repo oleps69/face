@@ -1,133 +1,155 @@
 import os
 import sys
+import time
+import threading
 import subprocess
-import cv2
 import numpy as np
+import cv2
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from sklearn.metrics.pairwise import cosine_similarity
 
-# =======================
-# RUNTIME INSTALL (CRITICAL)
-# =======================
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+# =========================
+# GLOBAL STATE
+# =========================
+INSTALL_DONE = False
+MODEL_READY = False
+INSTALL_PROGRESS = {"stage": "starting", "percent": 0}
+MODEL_PROGRESS = {"stage": "waiting", "percent": 0}
 
-try:
-    import torch
-except ImportError:
-    install("torch")
-    import torch
+EMBEDDINGS = None
+LABELS = None
+THRESHOLD = None
+FACE_APP = None
 
-try:
+BASE_DIR = os.path.dirname(__file__)
+
+# =========================
+# LOG THREAD (5 saniyede 1)
+# =========================
+def progress_logger():
+    while not MODEL_READY:
+        print(
+            f"[STATUS] install={INSTALL_PROGRESS} | model={MODEL_PROGRESS}",
+            flush=True
+        )
+        time.sleep(5)
+
+# =========================
+# LAZY INSTALL
+# =========================
+def lazy_install():
+    global INSTALL_DONE
+
+    packages = [
+        "opencv-python-headless==4.9.0.80",
+        "insightface==0.7.3",
+        "onnxruntime==1.17.3"
+    ]
+
+    INSTALL_PROGRESS["stage"] = "installing packages"
+    for i, pkg in enumerate(packages):
+        INSTALL_PROGRESS["percent"] = int((i / len(packages)) * 100)
+        print(f"[INSTALL] Installing {pkg}", flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+    INSTALL_PROGRESS["percent"] = 100
+    INSTALL_PROGRESS["stage"] = "done"
+    INSTALL_DONE = True
+
+# =========================
+# LOAD MODEL + DATA
+# =========================
+def load_model_and_data():
+    global FACE_APP, EMBEDDINGS, LABELS, THRESHOLD, MODEL_READY
+
     from insightface.app import FaceAnalysis
-except ImportError:
-    install("onnxruntime")
-    install("insightface")
-    from insightface.app import FaceAnalysis
 
-# =======================
-# PATHS (SENİN YAPIN)
-# =======================
-BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+    MODEL_PROGRESS["stage"] = "loading numpy files"
+    MODEL_PROGRESS["percent"] = 10
 
-EMB_PATH = os.path.join(BASE_PATH, "embeddings.npy")
-LBL_PATH = os.path.join(BASE_PATH, "labels.npy")
-THR_PATH = os.path.join(BASE_PATH, "threshold.txt")
+    EMBEDDINGS = np.load(os.path.join(BASE_DIR, "embeddings.npy"))
+    LABELS = np.load(os.path.join(BASE_DIR, "labels.npy"))
 
-# =======================
-# LOAD DATA
-# =======================
-embeddings = np.load(EMB_PATH)
-labels = np.load(LBL_PATH)
+    with open(os.path.join(BASE_DIR, "threshold.txt")) as f:
+        THRESHOLD = float(f.read().strip())
 
-with open(THR_PATH, "r") as f:
-    AUTO_THRESHOLD = float(f.read())
+    MODEL_PROGRESS["stage"] = "initializing insightface"
+    MODEL_PROGRESS["percent"] = 40
 
-# =======================
-# FACE MODEL (CPU ONLY)
-# =======================
-providers = ["CPUExecutionProvider"]
+    FACE_APP = FaceAnalysis(providers=["CPUExecutionProvider"])
+    FACE_APP.prepare(ctx_id=0)
 
-face_app = FaceAnalysis(
-    name="buffalo_s",  # buffalo_l yerine SÜRAT + STABIL
-    providers=providers
-)
+    MODEL_PROGRESS["stage"] = "ready"
+    MODEL_PROGRESS["percent"] = 100
+    MODEL_READY = True
 
-face_app.prepare(
-    ctx_id=-1,          # CPU
-    det_size=(640, 640)
-)
+# =========================
+# BACKGROUND STARTUP
+# =========================
+def startup_pipeline():
+    lazy_install()
+    load_model_and_data()
 
-# =======================
+threading.Thread(target=progress_logger, daemon=True).start()
+threading.Thread(target=startup_pipeline, daemon=True).start()
+
+# =========================
 # FASTAPI
-# =======================
-app = FastAPI(
-    title="Professional Face Recognition API",
-    version="1.0.0"
-)
+# =========================
+app = FastAPI(title="Face Recognition API")
 
-# =======================
-# HEALTH CHECK
-# =======================
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "gpu": False,
-        "threshold": AUTO_THRESHOLD,
-        "total_embeddings": int(len(embeddings)),
-        "unique_ids": int(len(set(labels.tolist())))
+        "install_done": INSTALL_DONE,
+        "model_ready": MODEL_READY,
+        "install_progress": INSTALL_PROGRESS,
+        "model_progress": MODEL_PROGRESS,
+        "total_embeddings": 0 if EMBEDDINGS is None else len(EMBEDDINGS)
     }
 
-# =======================
-# IDENTIFY
-# =======================
 @app.post("/identify")
-async def identify(image: UploadFile = File(...)):
-    try:
-        image_bytes = await image.read()
-        img_np = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+async def identify(file: UploadFile = File(...)):
+    if not MODEL_READY:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Model not ready yet"}
+        )
 
-        if img is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Invalid image file"}
-            )
+    img_bytes = await file.read()
+    img = cv2.imdecode(
+        np.frombuffer(img_bytes, np.uint8),
+        cv2.IMREAD_COLOR
+    )
 
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    faces = FACE_APP.get(img)
+    if len(faces) != 1:
+        return {"error": "Exactly one face required"}
 
-        faces = face_app.get(img)
+    emb = faces[0].embedding.reshape(1, -1)
+    sims = cosine_similarity(emb, EMBEDDINGS)[0]
 
-        if len(faces) != 1:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Exactly one face must be present"}
-            )
+    best_idx = int(np.argmax(sims))
+    best_score = float(sims[best_idx])
 
-        emb = faces[0].embedding.reshape(1, -1)
-        sims = cosine_similarity(emb, embeddings)[0]
-
-        best_idx = int(np.argmax(sims))
-        best_score = float(sims[best_idx])
-        best_label = int(labels[best_idx])
-
-        if best_score < AUTO_THRESHOLD:
-            return {
-                "recognized": False,
-                "person_id": None,
-                "score": round(best_score, 4)
-            }
-
+    if best_score < THRESHOLD:
         return {
-            "recognized": True,
-            "person_id": best_label,
+            "result": "unknown",
             "score": round(best_score, 4)
         }
 
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+    return {
+        "result": "recognized",
+        "label": int(LABELS[best_idx]),
+        "score": round(best_score, 4)
+    }
+
+# =========================
+# LOCAL RUN
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
