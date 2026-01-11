@@ -3,7 +3,6 @@ Face Recognition API - Production Ready
 Uses ArcFace ResNet100 INT8 ONNX Model
 Complete implementation with comprehensive logging and error handling
 """
-
 import os
 import sys
 import time
@@ -28,7 +27,6 @@ from pydantic import BaseModel
 # ============================================================================
 # CONFIGURATION & CONSTANTS
 # ============================================================================
-
 class Config:
     """Centralized configuration"""
     # Model Configuration
@@ -55,7 +53,6 @@ class Config:
     REQUEST_TIMEOUT = 60  # seconds
     
     # Storage Configuration - Check multiple possible locations
-    # Railway puts files in root, but we'll check both
     POSSIBLE_STORAGE_PATHS = [
         Path("/app/storage"),
         Path("/app"),
@@ -63,39 +60,53 @@ class Config:
         Path(".")
     ]
     
-    # Will be set dynamically
-    STORAGE_DIR = None
-    EMBEDDINGS_FILE = None
-    LABELS_FILE = None
-    THRESHOLD_FILE = None
-    LOGS_DIR = None
+    # Default storage paths
+    STORAGE_DIR = Path("./storage")
+    EMBEDDINGS_FILE = STORAGE_DIR / "embeddings.npy"
+    LABELS_FILE = STORAGE_DIR / "labels.npy"
+    THRESHOLD_FILE = STORAGE_DIR / "threshold.txt"
+    LOGS_DIR = STORAGE_DIR / "logs"
     
     @classmethod
     def setup_storage_paths(cls):
-        """Find where embeddings.npy actually is"""
+        """Find where embeddings.npy actually is or create default"""
         for path in cls.POSSIBLE_STORAGE_PATHS:
             embeddings_path = path / "embeddings.npy"
             if embeddings_path.exists():
                 cls.STORAGE_DIR = path
                 cls.EMBEDDINGS_FILE = embeddings_path
-                cls.LABELS_FILE = path / "labels.npy"  # Changed to .npy
+                cls.LABELS_FILE = path / "labels.npy"
                 cls.THRESHOLD_FILE = path / "threshold.txt"
                 cls.LOGS_DIR = path / "logs"
-                Logger.info(f"Found embeddings at: {embeddings_path}")
+                print(f"[INFO] Found embeddings at: {embeddings_path}", flush=True)
                 return True
         
-        # If not found, use default
-        cls.STORAGE_DIR = cls.POSSIBLE_STORAGE_PATHS[0]
+        # If not found, use first writable path
+        for path in cls.POSSIBLE_STORAGE_PATHS:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                cls.STORAGE_DIR = path
+                cls.EMBEDDINGS_FILE = path / "embeddings.npy"
+                cls.LABELS_FILE = path / "labels.npy"
+                cls.THRESHOLD_FILE = path / "threshold.txt"
+                cls.LOGS_DIR = path / "logs"
+                print(f"[INFO] Using storage path: {path}", flush=True)
+                return False
+            except Exception:
+                continue
+        
+        # Fallback to current directory
+        cls.STORAGE_DIR = Path(".")
         cls.EMBEDDINGS_FILE = cls.STORAGE_DIR / "embeddings.npy"
         cls.LABELS_FILE = cls.STORAGE_DIR / "labels.npy"
         cls.THRESHOLD_FILE = cls.STORAGE_DIR / "threshold.txt"
         cls.LOGS_DIR = cls.STORAGE_DIR / "logs"
+        print(f"[INFO] Fallback to current directory", flush=True)
         return False
 
 # ============================================================================
 # GLOBAL STATE MANAGEMENT
 # ============================================================================
-
 class GlobalState:
     """Thread-safe global state manager"""
     def __init__(self):
@@ -160,14 +171,16 @@ state = GlobalState()
 # ============================================================================
 # LOGGING UTILITIES
 # ============================================================================
-
 class Logger:
     """Enhanced logging with file and console output"""
     
     @staticmethod
     def setup():
         """Create logs directory"""
-        Config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            Config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[WARNING] Could not create logs dir: {e}", flush=True)
         
     @staticmethod
     def _log(level: str, message: str, data: Optional[Dict] = None):
@@ -191,8 +204,8 @@ class Logger:
             log_file = Config.LOGS_DIR / f"app_{datetime.now().strftime('%Y%m%d')}.log"
             with open(log_file, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
-        except Exception as e:
-            print(f"[ERROR] Failed to write to log file: {e}", flush=True)
+        except Exception:
+            pass  # Silent fail for logging
     
     @staticmethod
     def info(message: str, data: Optional[Dict] = None):
@@ -223,7 +236,6 @@ class Logger:
 # ============================================================================
 # MODEL MANAGEMENT
 # ============================================================================
-
 class ModelManager:
     """Handles model download, loading, and inference"""
     
@@ -258,8 +270,8 @@ class ModelManager:
                             percent = int((downloaded / total_size) * 100)
                             speed_mbps = (downloaded / (1024 * 1024)) / max(time.time() - start_time, 0.1)
                             state.update_model(
-                                "downloading", 
-                                percent, 
+                                "downloading",
+                                percent,
                                 f"Downloading... {percent}% ({speed_mbps:.2f} MB/s)"
                             )
             
@@ -394,8 +406,9 @@ class ModelManager:
             # Extract embedding
             embedding = outputs[0]
             
-            # Normalize embedding (L2 normalization)
-            embedding_norm = embedding / np.linalg.norm(embedding)
+            # Normalize embedding (L2 normalization) - CRITICAL FIX
+            embedding_flat = embedding.flatten()
+            embedding_norm = embedding_flat / np.linalg.norm(embedding_flat)
             
             total_time = time.time() - start_time
             
@@ -417,7 +430,6 @@ class ModelManager:
 # ============================================================================
 # FILE HANDLING
 # ============================================================================
-
 class FileHandler:
     """Handles file upload validation and processing"""
     
@@ -433,22 +445,6 @@ class FileHandler:
             file_ext = Path(file.filename).suffix.lower()
             if file_ext not in Config.ALLOWED_EXTENSIONS:
                 return False, f"Invalid file type. Allowed: {', '.join(Config.ALLOWED_EXTENSIONS)}"
-            
-            # Check content type - be lenient, some clients don't set it correctly
-            content_type = file.content_type or ""
-            
-            # If content type is missing or generic, rely on extension
-            if not content_type or content_type in ["application/octet-stream", "binary/octet-stream"]:
-                Logger.debug("Content type missing or generic, accepting based on extension", {
-                    "filename": file.filename,
-                    "extension": file_ext,
-                    "content_type": content_type
-                })
-                return True, None
-            
-            # Otherwise check if it's an image
-            if not content_type.startswith("image/"):
-                return False, f"File must be an image (got content-type: {content_type})"
             
             return True, None
             
@@ -494,19 +490,20 @@ class FileHandler:
 # ============================================================================
 # STORAGE MANAGEMENT
 # ============================================================================
-
 class StorageManager:
     """Handles persistent storage of embeddings and labels"""
     
     @staticmethod
     def setup():
         """Initialize storage directories"""
-        # Find where embeddings actually are
         Config.setup_storage_paths()
         
-        if Config.STORAGE_DIR:
-            Config.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-            Logger.info("Storage initialized", {"path": str(Config.STORAGE_DIR)})
+        try:
+            if Config.STORAGE_DIR:
+                Config.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+                Logger.info("Storage initialized", {"path": str(Config.STORAGE_DIR)})
+        except Exception as e:
+            Logger.warning("Could not create storage dir", {"error": str(e)})
     
     @staticmethod
     def load_database():
@@ -533,7 +530,8 @@ class StorageManager:
                     labels = [f"person_{i}" for i in range(len(embeddings))]
                     Logger.warning("No labels file found, creating generic labels")
                 
-                state.embeddings_db = list(embeddings)
+                # Store as list of flat arrays
+                state.embeddings_db = [emb.flatten() for emb in embeddings]
                 state.labels_db = labels
                 state.total_embeddings = len(embeddings)
                 
@@ -581,7 +579,6 @@ class StorageManager:
 # ============================================================================
 # BACKGROUND TASKS
 # ============================================================================
-
 class BackgroundWorker:
     """Handles background threads"""
     
@@ -675,8 +672,6 @@ class BackgroundWorker:
 # ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
-
-# Create FastAPI app
 app = FastAPI(
     title="Face Recognition API",
     description="Production-ready face recognition API using ArcFace ResNet100 INT8",
@@ -685,7 +680,6 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -697,7 +691,6 @@ app.add_middleware(
 # ============================================================================
 # API ROUTES
 # ============================================================================
-
 @app.get("/")
 def root():
     """Root endpoint"""
@@ -800,7 +793,7 @@ async def identify_face(file: UploadFile = File(...)):
         return {
             "success": True,
             "request_id": request_id,
-            "embedding": embedding.flatten().tolist(),
+            "embedding": embedding.tolist(),
             "embedding_shape": list(embedding.shape),
             "embedding_size": int(np.prod(embedding.shape)),
             "metadata": metadata,
@@ -849,7 +842,7 @@ async def register_face(
         embedding, metadata = ModelManager.compute_embedding(image)
         
         # Add to database
-        state.embeddings_db.append(embedding.flatten())
+        state.embeddings_db.append(embedding)
         state.labels_db.append(label)
         state.increment_embeddings()
         
@@ -912,13 +905,14 @@ async def search_face(file: UploadFile = File(...), threshold: float = Form(None
         
         # Compute embedding
         query_embedding, metadata = ModelManager.compute_embedding(image)
-        query_flat = query_embedding.flatten()
         
-        # Search in database
+        # Search in database - CRITICAL FIX: Cosine similarity for normalized vectors
         similarities = []
         for idx, db_embedding in enumerate(state.embeddings_db):
-            # Cosine similarity
-            similarity = float(np.dot(query_flat, db_embedding))
+            # Both embeddings are already L2 normalized, so dot product = cosine similarity
+            similarity = float(np.dot(query_embedding, db_embedding))
+            
+            # Only include if above threshold
             if similarity >= threshold:
                 similarities.append({
                     "index": idx,
@@ -927,17 +921,26 @@ async def search_face(file: UploadFile = File(...), threshold: float = Form(None
                     "confidence": round(similarity * 100, 2)
                 })
         
-        # Sort by similarity
+        # Sort by similarity (descending)
         similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        # Format response like original Gradio code
+        if similarities:
+            best_match = similarities[0]
+            result_message = f"{best_match['label']} ✅ | Skor: {best_match['similarity']:.4f}"
+        else:
+            result_message = f"Başka biri ❌ | En yüksek skor: {max([np.dot(query_embedding, db_emb) for db_emb in state.embeddings_db]):.4f if state.embeddings_db else 0:.4f}"
         
         Logger.success(f"[{request_id}] Search completed", {
             "matches_found": len(similarities),
-            "database_size": len(state.embeddings_db)
+            "database_size": len(state.embeddings_db),
+            "result": result_message
         })
         
         return {
             "success": True,
             "request_id": request_id,
+            "result": result_message,
             "matches": similarities,
             "total_checked": len(state.embeddings_db),
             "threshold": threshold,
@@ -983,11 +986,11 @@ async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(
         embedding1, metadata1 = ModelManager.compute_embedding(image1)
         embedding2, metadata2 = ModelManager.compute_embedding(image2)
         
-        # Calculate similarity (cosine similarity)
-        similarity = float(np.dot(embedding1.flatten(), embedding2.flatten()))
+        # Calculate similarity (cosine similarity for normalized vectors)
+        similarity = float(np.dot(embedding1, embedding2))
         
         # Determine match
-        is_match = similarity >= 0.6  # Default threshold
+        is_match = similarity >= state.default_threshold
         confidence = round(similarity * 100, 2)
         
         Logger.success(f"[{request_id}] Comparison completed", {
@@ -1001,6 +1004,7 @@ async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(
             "similarity": round(similarity, 4),
             "confidence": confidence,
             "is_match": is_match,
+            "threshold": state.default_threshold,
             "metadata": {
                 "file1": metadata1,
                 "file2": metadata2
@@ -1029,6 +1033,7 @@ def database_stats():
             "label_distribution": dict(
                 sorted(label_counts.items(), key=lambda x: x[1], reverse=True)
             ),
+            "threshold": state.default_threshold,
             "storage": {
                 "embeddings_file": str(Config.EMBEDDINGS_FILE),
                 "labels_file": str(Config.LABELS_FILE),
@@ -1073,163 +1078,6 @@ def clear_database():
         Logger.error("Failed to clear database", {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/database/remove/{index}")
-def remove_embedding(index: int):
-    """Remove specific embedding by index"""
-    try:
-        if index < 0 or index >= len(state.embeddings_db):
-            raise HTTPException(status_code=404, detail=f"Index {index} not found")
-        
-        removed_label = state.labels_db[index]
-        
-        # Remove from database
-        del state.embeddings_db[index]
-        del state.labels_db[index]
-        
-        # Save database
-        StorageManager.save_database()
-        
-        Logger.info(f"Removed embedding at index {index}", {"label": removed_label})
-        
-        return {
-            "success": True,
-            "message": f"Removed embedding at index {index}",
-            "removed_label": removed_label,
-            "new_database_size": len(state.embeddings_db)
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        Logger.error("Failed to remove embedding", {"error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/logs/recent")
-def recent_logs(count: int = 20):
-    """Get recent log entries"""
-    try:
-        log_file = Config.LOGS_DIR / f"app_{datetime.now().strftime('%Y%m%d')}.log"
-        
-        if not log_file.exists():
-            return {
-                "success": True,
-                "logs": [],
-                "message": "No logs found for today"
-            }
-        
-        with open(log_file, 'r') as f:
-            lines = f.readlines()
-        
-        # Get last N lines
-        recent = lines[-count:] if len(lines) > count else lines
-        logs = []
-        
-        for line in recent:
-            if line.strip():
-                try:
-                    logs.append(json.loads(line.strip()))
-                except json.JSONDecodeError:
-                    continue
-        
-        return {
-            "success": True,
-            "logs": logs,
-            "count": len(logs),
-            "total_lines": len(lines)
-        }
-        
-    except Exception as e:
-        Logger.error("Failed to read logs", {"error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/errors/recent")
-def recent_errors(count: int = 10):
-    """Get recent errors"""
-    try:
-        errors = state.errors[-count:] if state.errors else []
-        return {
-            "success": True,
-            "errors": errors,
-            "count": len(errors),
-            "total_errors": len(state.errors)
-        }
-    except Exception as e:
-        Logger.error("Failed to get errors", {"error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/model/reload")
-def reload_model():
-    """Reload the model (useful after update)"""
-    try:
-        Logger.info("Manual model reload requested")
-        
-        if not Config.MODEL_PATH.exists():
-            raise HTTPException(status_code=404, detail="Model file not found")
-        
-        # Load model
-        session = ModelManager.load_model(Config.MODEL_PATH)
-        
-        if session is None:
-            raise HTTPException(status_code=500, detail="Failed to load model")
-        
-        # Update global state
-        state.set_model_session(session)
-        
-        Logger.success("Model reloaded successfully")
-        
-        return {
-            "success": True,
-            "message": "Model reloaded successfully",
-            "model_info": {
-                "path": str(Config.MODEL_PATH),
-                "size_mb": round(Config.MODEL_PATH.stat().st_size / 1024 / 1024, 2),
-                "exists": Config.MODEL_PATH.exists()
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        Logger.error("Model reload failed", {"error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/config")
-def get_config():
-    """Get current configuration"""
-    return {
-        "success": True,
-        "model": {
-            "url": Config.MODEL_URL,
-            "name": Config.MODEL_NAME,
-            "path": str(Config.MODEL_PATH),
-            "input_size": Config.INPUT_SIZE,
-            "embedding_size": Config.EMBEDDING_SIZE,
-            "input_mean": Config.INPUT_MEAN,
-            "input_std": Config.INPUT_STD
-        },
-        "api": {
-            "host": Config.HOST,
-            "port": Config.PORT,
-            "max_file_size_mb": round(Config.MAX_FILE_SIZE / 1024 / 1024, 2),
-            "allowed_extensions": list(Config.ALLOWED_EXTENSIONS),
-            "request_timeout": Config.REQUEST_TIMEOUT
-        },
-        "storage": {
-            "storage_dir": str(Config.STORAGE_DIR),
-            "embeddings_file": str(Config.EMBEDDINGS_FILE),
-            "labels_file": str(Config.LABELS_FILE),
-            "logs_dir": str(Config.LOGS_DIR)
-        },
-        "performance": {
-            "download_chunk_size": Config.DOWNLOAD_CHUNK_SIZE,
-            "status_log_interval": Config.STATUS_LOG_INTERVAL
-        }
-    }
-
-# ============================================================================
-# STARTUP & SHUTDOWN EVENTS
-# ============================================================================
-
 @app.on_event("startup")
 async def startup_event():
     """FastAPI startup event"""
@@ -1264,56 +1112,6 @@ async def shutdown_event():
     
     Logger.info("Shutdown complete")
 
-# ============================================================================
-# EXCEPTION HANDLERS
-# ============================================================================
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Custom HTTP exception handler"""
-    Logger.warning("HTTP Exception", {
-        "status_code": exc.status_code,
-        "detail": exc.detail,
-        "path": str(request.url),
-        "method": request.method
-    })
-    
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "success": False,
-            "error": exc.detail,
-            "status_code": exc.status_code,
-            "timestamp": datetime.now().isoformat(),
-            "path": str(request.url)
-        }
-    )
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """General exception handler"""
-    Logger.error("Unhandled exception", {
-        "error": str(exc),
-        "traceback": traceback.format_exc(),
-        "path": str(request.url),
-        "method": request.method
-    })
-    
-    return JSONResponse(
-        status_code=500,
-        content={
-            "success": False,
-            "error": "Internal server error",
-            "detail": str(exc),
-            "timestamp": datetime.now().isoformat(),
-            "path": str(request.url)
-        }
-    )
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-
 def main():
     """Main entry point"""
     print("=" * 80)
@@ -1324,7 +1122,6 @@ def main():
     print(f"Host: {Config.HOST}")
     print(f"Port: {Config.PORT}")
     print(f"Docs: http://{Config.HOST}:{Config.PORT}/docs")
-    print(f"Storage: {Config.STORAGE_DIR}")
     print("=" * 80)
     print()
     
