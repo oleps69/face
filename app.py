@@ -54,11 +54,43 @@ class Config:
     STATUS_LOG_INTERVAL = 5  # seconds
     REQUEST_TIMEOUT = 60  # seconds
     
-    # Storage Configuration
-    STORAGE_DIR = Path("/app/storage")
-    EMBEDDINGS_FILE = STORAGE_DIR / "embeddings.npy"
-    LABELS_FILE = STORAGE_DIR / "labels.json"
-    LOGS_DIR = STORAGE_DIR / "logs"
+    # Storage Configuration - Check multiple possible locations
+    # Railway puts files in root, but we'll check both
+    POSSIBLE_STORAGE_PATHS = [
+        Path("/app/storage"),
+        Path("/app"),
+        Path("./storage"),
+        Path(".")
+    ]
+    
+    # Will be set dynamically
+    STORAGE_DIR = None
+    EMBEDDINGS_FILE = None
+    LABELS_FILE = None
+    THRESHOLD_FILE = None
+    LOGS_DIR = None
+    
+    @classmethod
+    def setup_storage_paths(cls):
+        """Find where embeddings.npy actually is"""
+        for path in cls.POSSIBLE_STORAGE_PATHS:
+            embeddings_path = path / "embeddings.npy"
+            if embeddings_path.exists():
+                cls.STORAGE_DIR = path
+                cls.EMBEDDINGS_FILE = embeddings_path
+                cls.LABELS_FILE = path / "labels.npy"  # Changed to .npy
+                cls.THRESHOLD_FILE = path / "threshold.txt"
+                cls.LOGS_DIR = path / "logs"
+                Logger.info(f"Found embeddings at: {embeddings_path}")
+                return True
+        
+        # If not found, use default
+        cls.STORAGE_DIR = cls.POSSIBLE_STORAGE_PATHS[0]
+        cls.EMBEDDINGS_FILE = cls.STORAGE_DIR / "embeddings.npy"
+        cls.LABELS_FILE = cls.STORAGE_DIR / "labels.npy"
+        cls.THRESHOLD_FILE = cls.STORAGE_DIR / "threshold.txt"
+        cls.LOGS_DIR = cls.STORAGE_DIR / "logs"
+        return False
 
 # ============================================================================
 # GLOBAL STATE MANAGEMENT
@@ -75,6 +107,7 @@ class GlobalState:
         self.total_requests = 0
         self.embeddings_db: List[np.ndarray] = []
         self.labels_db: List[str] = []
+        self.default_threshold = 0.6  # Default threshold
         self.startup_time = time.time()
         self.errors: List[Dict] = []
         
@@ -401,10 +434,21 @@ class FileHandler:
             if file_ext not in Config.ALLOWED_EXTENSIONS:
                 return False, f"Invalid file type. Allowed: {', '.join(Config.ALLOWED_EXTENSIONS)}"
             
-            # Check content type
+            # Check content type - be lenient, some clients don't set it correctly
             content_type = file.content_type or ""
+            
+            # If content type is missing or generic, rely on extension
+            if not content_type or content_type in ["application/octet-stream", "binary/octet-stream"]:
+                Logger.debug("Content type missing or generic, accepting based on extension", {
+                    "filename": file.filename,
+                    "extension": file_ext,
+                    "content_type": content_type
+                })
+                return True, None
+            
+            # Otherwise check if it's an image
             if not content_type.startswith("image/"):
-                return False, "File must be an image"
+                return False, f"File must be an image (got content-type: {content_type})"
             
             return True, None
             
@@ -457,25 +501,54 @@ class StorageManager:
     @staticmethod
     def setup():
         """Initialize storage directories"""
-        Config.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-        Logger.info("Storage initialized", {"path": str(Config.STORAGE_DIR)})
+        # Find where embeddings actually are
+        Config.setup_storage_paths()
+        
+        if Config.STORAGE_DIR:
+            Config.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+            Logger.info("Storage initialized", {"path": str(Config.STORAGE_DIR)})
     
     @staticmethod
     def load_database():
         """Load embeddings and labels from disk"""
         try:
-            if Config.EMBEDDINGS_FILE.exists() and Config.LABELS_FILE.exists():
+            # Check if embeddings exist
+            if Config.EMBEDDINGS_FILE and Config.EMBEDDINGS_FILE.exists():
+                Logger.info("Loading embeddings from disk", {"path": str(Config.EMBEDDINGS_FILE)})
                 embeddings = np.load(Config.EMBEDDINGS_FILE)
-                with open(Config.LABELS_FILE, 'r') as f:
-                    labels = json.load(f)
+                
+                # Load labels - try both .npy and .json
+                labels = None
+                if Config.LABELS_FILE.exists():
+                    if Config.LABELS_FILE.suffix == '.npy':
+                        labels = np.load(Config.LABELS_FILE, allow_pickle=True).tolist()
+                        Logger.info("Loaded labels from .npy file")
+                    elif Config.LABELS_FILE.suffix == '.json':
+                        with open(Config.LABELS_FILE, 'r') as f:
+                            labels = json.load(f)
+                        Logger.info("Loaded labels from .json file")
+                
+                # If labels file doesn't exist, create generic labels
+                if labels is None:
+                    labels = [f"person_{i}" for i in range(len(embeddings))]
+                    Logger.warning("No labels file found, creating generic labels")
                 
                 state.embeddings_db = list(embeddings)
                 state.labels_db = labels
                 state.total_embeddings = len(embeddings)
                 
-                Logger.success("Database loaded", {
+                # Load threshold if exists
+                if Config.THRESHOLD_FILE and Config.THRESHOLD_FILE.exists():
+                    with open(Config.THRESHOLD_FILE, 'r') as f:
+                        threshold = float(f.read().strip())
+                        state.default_threshold = threshold
+                        Logger.info(f"Loaded threshold: {threshold}")
+                
+                Logger.success("Database loaded successfully", {
                     "embeddings_count": len(embeddings),
-                    "labels_count": len(labels)
+                    "labels_count": len(labels),
+                    "embeddings_shape": embeddings.shape,
+                    "threshold": state.default_threshold
                 })
             else:
                 Logger.info("No existing database found, starting fresh")
@@ -487,12 +560,16 @@ class StorageManager:
     def save_database():
         """Save embeddings and labels to disk"""
         try:
-            if state.embeddings_db:
+            if state.embeddings_db and Config.EMBEDDINGS_FILE:
                 embeddings_array = np.array(state.embeddings_db)
                 np.save(Config.EMBEDDINGS_FILE, embeddings_array)
                 
-                with open(Config.LABELS_FILE, 'w') as f:
-                    json.dump(state.labels_db, f)
+                # Save as .npy if original was .npy, otherwise json
+                if Config.LABELS_FILE.suffix == '.npy':
+                    np.save(Config.LABELS_FILE, np.array(state.labels_db, dtype=object))
+                else:
+                    with open(Config.LABELS_FILE, 'w') as f:
+                        json.dump(state.labels_db, f)
                 
                 Logger.success("Database saved", {
                     "embeddings_count": len(state.embeddings_db),
@@ -799,12 +876,17 @@ async def register_face(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search")
-async def search_face(file: UploadFile = File(...), threshold: float = Form(0.6)):
+async def search_face(file: UploadFile = File(...), threshold: float = Form(None)):
     """
     Search for a face in the database
     Returns best matches above threshold
     """
     request_id = hashlib.md5(f"{time.time()}".encode()).hexdigest()[:8]
+    
+    # Use default threshold if not provided
+    if threshold is None:
+        threshold = state.default_threshold
+    
     Logger.info(f"[{request_id}] Search request", {"threshold": threshold})
     
     try:
