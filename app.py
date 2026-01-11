@@ -63,12 +63,11 @@ class Config:
         Path(".")
     ]
     
-    # Will be set dynamically
-    STORAGE_DIR = None
-    EMBEDDINGS_FILE = None
-    LABELS_FILE = None
-    THRESHOLD_FILE = None
-    LOGS_DIR = None
+    # Storage Configuration
+    STORAGE_DIR = Path("/app/storage")
+    EMBEDDINGS_FILE = STORAGE_DIR / "embeddings.npy"
+    LABELS_FILE = STORAGE_DIR / "labels.json"
+    LOGS_DIR = STORAGE_DIR / "logs"
     
     @classmethod
     def setup_storage_paths(cls):
